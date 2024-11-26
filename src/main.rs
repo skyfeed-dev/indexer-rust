@@ -1,141 +1,81 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use clap::{value_parser, Arg, ArgAction, Command};
-use colog::format::CologStyle;
-use colored::Colorize;
-use log::{error, info, Level, LevelFilter};
-use rayon::ThreadPoolBuilder;
+use ::log::error;
+use anyhow::Context;
+use config::Args;
 use tokio::runtime::Builder;
+use tokio_rustls::rustls::crypto::aws_lc_rs::default_provider;
 
-use mimalloc::MiMalloc;
+mod config;
+mod database;
+mod log;
+mod websocket;
 
-mod application;
-
+/// Override the global allocator with mimalloc
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-pub struct CustomPrefixToken;
+/// Entry point for the application
+fn main() {
+    // parse command line arguments
+    let args = config::parse_args();
 
-impl CologStyle for CustomPrefixToken {
-    fn prefix_token(&self, level: &Level) -> String {
-        format!(
-            "[{}] [{}]",
-            chrono::Local::now().format("%d.%m.%Y %H:%M:%S"),
-            match level {
-                Level::Error => "E".red(),
-                Level::Warn => "W".yellow(),
-                Level::Info => "*".green(),
-                Level::Debug => "D".blue(),
-                Level::Trace => "T".purple(),
-            }
-        )
+    // initialize logging and dump configuration
+    log::init(args.log_level());
+    args.dump();
+
+    // build async runtime
+    let rt = if let Some(threads) = args.executors {
+        Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(threads)
+            .thread_name_fn(|| {
+                static ATOMIC: AtomicUsize = AtomicUsize::new(0);
+                let id = ATOMIC.fetch_add(1, Ordering::Relaxed);
+                format!("Tokio Async Thread {}", id)
+            })
+            .build()
+            .unwrap()
+    } else {
+        Builder::new_multi_thread()
+            .enable_all()
+            .thread_name_fn(|| {
+                static ATOMIC: AtomicUsize = AtomicUsize::new(0);
+                let id = ATOMIC.fetch_add(1, Ordering::Relaxed);
+                format!("Tokio Async Thread {}", id)
+            })
+            .build()
+            .unwrap()
+    };
+
+    // launch the application
+    default_provider().install_default().unwrap();
+    let err = rt.block_on(application_main(args));
+    if let Err(e) = &err {
+        error!(target: "indexer", "{:?}", e);
     }
+
+    // exit
+    std::process::exit(if err.is_ok() { 0 } else { 1 });
 }
 
-fn main() {
-    const DEFAULT_HOST: &str = "jetstream2.us-east.bsky.network";
-    const DEFAULT_CERT: &str = "/etc/ssl/certs/ISRG_Root_X1.pem";
+/// Asynchronous main function
+async fn application_main(args: Args) -> anyhow::Result<()> {
+    // connect to the database
+    let db = database::connect(args.dbhost, &args.username, &args.password)
+        .await
+        .context("Failed to connect to the database")?;
 
-    // parse command line arguments
-    let cmd = Command::new("jetstream")
-        .about("bluesky jetstream client")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author("PancakeTAS")
-        .arg(
-            Arg::new("host")
-                .long("host")
-                .help("The jetstream host to connect to")
-                .default_value(DEFAULT_HOST)
-                .action(ArgAction::Set)
-        )
-        .arg(
-            Arg::new("cert")
-                .long("cert")
-                .help("The certificate to use for the connection")
-                .default_value(DEFAULT_CERT)
-                .action(ArgAction::Set)
-        )
-        .arg(
-            Arg::new("async-threads")
-                .long("async-threads")
-                .help("The number of threads to use for the websocket and other async operations")
-                .value_parser(value_parser!(usize))
-                .default_value("0") // 0 means use all available cores
-                .action(ArgAction::Set)
-        )
-        .arg(
-            Arg::new("parse-threads")
-                .long("parse-threads")
-                .help("The number of threads to use for parsing messages")
-                .value_parser(value_parser!(usize))
-                .default_value("0")
-                .action(ArgAction::Set)
-        )
-        .arg(
-            Arg::new("verbose")
-                .short('v')
-                .long("verbose")
-                .help("Enable verbose output")
-                .action(ArgAction::SetTrue)
-        );
+    // fetch initial cursor
+    let cursor = database::fetch_cursor(&db, &args.host)
+        .await
+        .context("Failed to fetch cursor from database")?
+        .map_or(0, |e| e.time_us);
 
-    let matches = cmd.get_matches();
-    let host: &String = matches.get_one("host")
-        .expect("invalid value for --host");
-    let cert: &String = matches.get_one("cert")
-        .expect("invalid value for --cert");
-    let async_threads: usize = *matches.get_one("async-threads")
-        .expect("invalid value for --async-threads");
-    let parse_threads: usize = *matches.get_one("parse-threads")
-        .expect("invalid value for --parse-threads");
-    let verbose = matches.get_flag("verbose");
+    // enter websocket event loop
+    websocket::start(args.host, args.certificate, cursor, args.handlers, db)
+        .await
+        .context("WebSocket event loop failed")?;
 
-    // initialize logging
-    let loglevel = if verbose { LevelFilter::Debug } else { LevelFilter::Info };
-    colog::default_builder()
-        .filter_level(LevelFilter::Off)
-        .filter_module("jetstream", loglevel)
-        .format(colog::formatter(CustomPrefixToken))
-        .init();
-    info!(target: "jetstream",
-        "\n=============================================\n\
-        jetstream client - v{}\n\
-        =============================================\n\
-        \n\
-        host:          {}\n\
-        certificate:   {}\n\
-        async threads: {}\n\
-        parse threads: {}\n\
-        \n",
-        env!("CARGO_PKG_VERSION"),
-        host, cert, async_threads, parse_threads
-    );
-
-    // create global rayon thread pool
-    ThreadPoolBuilder::new()
-        .num_threads(parse_threads)
-        .thread_name(|i| format!("parse-{}", i))
-        .build_global()
-        .unwrap();
-
-    // build tokio runtime
-    let mut builder = Builder::new_multi_thread();
-    builder.enable_all();
-    builder.thread_name_fn(|| {
-        static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
-        let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
-        format!("async-{}", id)
-    });
-    if async_threads > 0 {
-        builder.worker_threads(async_threads);
-    }
-
-    let rt = builder.build().unwrap();
-
-    // launch async main
-    let main = rt.block_on(
-        application::launch_client(host, cert));
-    if main.is_err() {
-        error!(target: "jetstream", "{:?}", main.err().unwrap());
-    }
+    Ok(())
 }

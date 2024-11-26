@@ -1,5 +1,8 @@
 use anyhow::Context;
-use atrium_api::{record::KnownRecord, types::string::{Did, Handle, RecordKey}};
+use atrium_api::{
+    record::KnownRecord,
+    types::string::{Did, Handle, RecordKey},
+};
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
@@ -12,14 +15,14 @@ pub enum Commit {
         collection: String,
         rkey: RecordKey,
         record: KnownRecord,
-        cid: String
+        cid: String,
     },
     #[serde(rename = "delete")]
     Delete {
         rev: String,
         collection: String,
-        rkey: RecordKey
-    }
+        rkey: RecordKey,
+    },
 }
 
 #[derive(Deserialize, Debug)]
@@ -28,7 +31,7 @@ pub struct Identity {
     pub did: Did,
     pub handle: Handle,
     pub seq: u64,
-    pub time: String
+    pub time: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -37,7 +40,7 @@ pub struct Account {
     pub active: bool,
     pub did: Did,
     pub seq: u64,
-    pub time: String
+    pub time: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -48,43 +51,23 @@ pub enum Kind {
     CommitEvent {
         did: Did,
         time_us: u64,
-        commit: Commit
+        commit: Commit,
     },
     #[serde(rename = "identity")]
     IdentityEvent {
         did: Did,
         time_us: u64,
-        identity: Identity
+        identity: Identity,
     },
     #[serde(rename = "account")]
     KeyEvent {
         did: Did,
         time_us: u64,
-        account: Account
+        account: Account,
     },
 }
 
-///
 /// Parse an event from a string
-///
-/// # Arguments
-///
-/// * `msg` - The string to parse
-///
-/// # Returns
-///
-/// The parsed event
-///
-/// # Errors
-///
-/// If the event could not be parsed
-///
-/// # Safety
-///
-/// This function is unsafe because it uses `simd-json` to parse the event
-///
-pub fn parse_event(mut msg: String) -> Result<Kind, anyhow::Error> {
-    let event: Kind = unsafe { simd_json::from_str(msg.as_mut_str()) }
-        .context("failed to parse event")?;
-    Ok(event)
+pub fn parse_event(mut msg: String) -> anyhow::Result<Kind> {
+    Ok(unsafe { simd_json::from_str(msg.as_mut_str()) }.context("Failed to parse event")?)
 }
