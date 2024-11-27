@@ -2,7 +2,7 @@
 name = "indexer"
 version = "2.0.0"
 edition = "2021"
-authors = ["PancakeTAS"]
+authors = ["redsolver", "PancakeTAS"]
 description = "ATProto/Bluesky Indexer powered by SurrealDB and Jetstream"
 
 [dependencies]
